@@ -1,831 +1,746 @@
+
 package lab;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpServer;
-
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.net.URI;
-import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.node.*;
+import com.sun.net.httpserver.*;
+import java.net.*;
+import java.net.http.*;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.nio.file.*;
 import java.sql.*;
-import java.time.Duration;
-import java.time.Instant;
-import java.time.OffsetDateTime;
-import java.time.format.DateTimeParseException;
+import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors;
+import java.util.regex.*;
 
-/**
- * Polymarket Research Lab.
- *
- * Single-file Java application:
- * - Public Polymarket market-data collection (no credentials required)
- * - SQLite persistence
- * - Historical price backfill and live order-book polling
- * - Five research modules
- * - Basic parameter search / walk-forward evaluation
- * - Paper-only signals (no order placement code exists)
- * - Small JSON API and static dashboard server
- *
- * Important: historical price candles are not historical order books. A signal
- * based on candles is a research observation, not proof that a trade could fill.
- */
 public final class Main {
-    private static final ObjectMapper JSON = new ObjectMapper();
-    private static final String GAMMA = env("GAMMA_URL", "https://gamma-api.polymarket.com");
-    private static final String CLOB = env("CLOB_URL", "https://clob.polymarket.com");
-    private static final String DATA_API = env("DATA_API_URL", "https://data-api.polymarket.com");
-    private static final Path DATA_DIR = Path.of(env("DATA_DIR", "/app/data"));
-    private static final Path DB_FILE = DATA_DIR.resolve("lab.db");
-    private static final int PORT = Integer.parseInt(env("PORT", "8080"));
-    private static final int MARKET_LIMIT = Integer.parseInt(env("MARKET_LIMIT", "250"));
-    private static final int HISTORY_DAYS = Integer.parseInt(env("HISTORY_DAYS", "30"));
-    private static final int MAX_HISTORY_TOKENS_PER_CYCLE =
-            Integer.parseInt(env("MAX_HISTORY_TOKENS_PER_CYCLE", "60"));
-    private static final int WORKERS = Integer.parseInt(env("WORKERS", "4"));
-    private static final long BOOK_POLL_SECONDS = Long.parseLong(env("BOOK_POLL_SECONDS", "45"));
-    private static final long MARKET_REFRESH_MINUTES = Long.parseLong(env("MARKET_REFRESH_MINUTES", "15"));
-    private static final long HISTORY_REFRESH_HOURS = Long.parseLong(env("HISTORY_REFRESH_HOURS", "6"));
+    static final ObjectMapper J = new ObjectMapper();
+    static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .followRedirects(HttpClient.Redirect.NORMAL).build();
 
-    private static final HttpClient HTTP = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(15))
-            .followRedirects(HttpClient.Redirect.NORMAL)
-            .build();
+    static final String DB = System.getenv().getOrDefault("DB_FILE", "/app/data/lab.db");
+    static final int PORT = Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"));
+    static final int MAX = Integer.parseInt(System.getenv().getOrDefault("MAX_MARKETS", "2500"));
+    static final int INTERVAL = Integer.parseInt(System.getenv().getOrDefault("SCAN_SECONDS", "90"));
 
-    private static final ExecutorService HTTP_POOL = Executors.newFixedThreadPool(
-            Math.max(2, Math.min(8, WORKERS)), namedFactory("http"));
-    private static final ExecutorService BACKTEST_POOL = Executors.newFixedThreadPool(
-            Math.max(1, WORKERS), namedFactory("research"));
-    private static final ScheduledExecutorService SCHEDULER =
-            Executors.newScheduledThreadPool(3, namedFactory("scheduler"));
-    private static final AtomicBoolean STOPPING = new AtomicBoolean(false);
-    private static final AtomicLong lastMarketRefresh = new AtomicLong();
-    private static final AtomicLong lastHistoryRefresh = new AtomicLong();
-    private static final Map<String, Book> BOOK_CACHE = new ConcurrentHashMap<>();
-    private static final Map<String, Market> MARKETS = new ConcurrentHashMap<>();
-    private static final Deque<String> RECENT_LOGS = new ConcurrentLinkedDeque<>();
-    private static volatile String systemStatus = "STARTING";
-    private static volatile long startedAt = System.currentTimeMillis();
+    static final ExecutorService POOL = Executors.newFixedThreadPool(4);
+    static final ScheduledExecutorService TIMER = Executors.newScheduledThreadPool(2);
+    static final Map<String, Market> MARKETS = new ConcurrentHashMap<>();
 
-    private static final List<String> STRATEGY_NAMES = List.of(
-            "Nested-market relationships",
-            "YES/NO parity",
-            "Short-term reversal",
-            "Resolution countdown",
-            "Cross-market lead-lag"
-    );
+    static volatile String status = "STARTING";
+    static volatile String lastPair = "None evaluated";
+    static volatile long lastScan = 0;
+    static volatile long evaluated = 0;
+    static volatile long started = System.currentTimeMillis();
+
+    record Market(
+            String venue, String id, String question, String url,
+            String end, double price, String currency,
+            String entity, String predicate, double threshold,
+            String operator, String fingerprint
+    ) {}
+
+    record Pair(
+            Market a, Market b, String relation,
+            double confidence, double discrepancy, String explanation
+    ) {}
 
     public static void main(String[] args) throws Exception {
-        Files.createDirectories(DATA_DIR);
-        Database.init();
-        log("Starting Polymarket Research Lab; database=" + DB_FILE);
-        startWebServer();
-        systemStatus = "ONLINE";
+        Files.createDirectories(Path.of(DB).getParent());
+        initDB();
+        startWeb();
 
-        // Run an initial market refresh immediately, then keep collection independent
-        // from backtests so slow historical calls cannot block current book capture.
-        SCHEDULER.execute(() -> safeRun("initial market refresh", Main::refreshMarkets));
-        SCHEDULER.scheduleWithFixedDelay(
-                () -> safeRun("market refresh", Main::refreshMarkets),
-                MARKET_REFRESH_MINUTES, MARKET_REFRESH_MINUTES, TimeUnit.MINUTES);
-        SCHEDULER.scheduleWithFixedDelay(
-                () -> safeRun("order-book polling", Main::pollBooks),
-                10, BOOK_POLL_SECONDS, TimeUnit.SECONDS);
-        SCHEDULER.scheduleWithFixedDelay(
-                () -> safeRun("historical backfill", Main::backfillHistory),
-                30, HISTORY_REFRESH_HOURS, TimeUnit.HOURS);
-        SCHEDULER.scheduleWithFixedDelay(
-                () -> safeRun("strategy scan", Main::runStrategyScans),
-                20, 60, TimeUnit.SECONDS);
-        SCHEDULER.scheduleWithFixedDelay(
-                () -> safeRun("optimizer", Main::optimize),
-                2, 30, TimeUnit.MINUTES);
+        status = "ONLINE";
 
-        Runtime.getRuntime().addShutdownHook(new Thread(Main::shutdown, "shutdown"));
-        log("Application ready. Dashboard: http://0.0.0.0:" + PORT);
+        TIMER.scheduleWithFixedDelay(() -> {
+            try { scan(); }
+            catch (Throwable e) {
+                status = "ERROR: " + e.getMessage();
+                log("Scan error: " + e);
+            }
+        }, 0, INTERVAL, TimeUnit.SECONDS);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            status = "STOPPING";
+            TIMER.shutdown();
+            POOL.shutdown();
+        }));
+
+        log("Research engine started on port " + PORT);
     }
 
-    // ---------------------------------------------------------------------
-    // Collection
-    // ---------------------------------------------------------------------
+    // ============================================================
+    // MARKET INGESTION
+    // ============================================================
 
-    private static void refreshMarkets() {
-        long now = System.currentTimeMillis();
-        if (now - lastMarketRefresh.get() < 60_000) return;
-        lastMarketRefresh.set(now);
-        int stored = 0;
+    static void scan() {
+        status = "INGESTING";
+
+        List<CompletableFuture<Void>> jobs = List.of(
+                CompletableFuture.runAsync(Main::polymarket, POOL),
+                CompletableFuture.runAsync(Main::kalshi, POOL),
+                CompletableFuture.runAsync(Main::manifold, POOL)
+        );
+
+        for (var job : jobs) {
+            try { job.get(45, TimeUnit.SECONDS); }
+            catch (Exception e) { log("Provider timeout: " + e.getMessage()); }
+        }
+
+        status = "MATCHING";
+
+        List<Market> markets = new ArrayList<>(MARKETS.values());
+        if (markets.size() > MAX) {
+            markets.sort(Comparator.comparingDouble(
+                    (Market m) -> m.price > 0 ? 1 : 0).reversed());
+            markets = new ArrayList<>(markets.subList(0, MAX));
+        }
+
+        for (Market m : markets) saveMarket(m);
+
+        List<Pair> candidates = generatePairs(markets);
+
+        status = "EVALUATING";
+        evaluated = 0;
+
+        for (Pair p : candidates) {
+            savePair(p);
+            lastPair = p.a.venue + " / " + p.b.venue + " | "
+                    + p.relation + " | " + p.a.question + " <> " + p.b.question;
+            evaluated++;
+        }
+
+        lastScan = System.currentTimeMillis();
+        status = "ONLINE";
+
+        log("Scan finished. Markets=" + markets.size()
+                + ", candidate pairs=" + candidates.size());
+    }
+
+    static void polymarket() {
         try {
-            // Gamma's public markets endpoint supports active/closed filtering and offset pagination.
-            for (int offset = 0; offset < MARKET_LIMIT; offset += 100) {
-                String url = GAMMA + "/markets?active=true&closed=false&limit=100&offset=" + offset;
-                JsonNode response = getJson(url);
-                if (!response.isArray() || response.isEmpty()) break;
-                for (JsonNode node : response) {
-                    Market market = parseMarket(node);
-                    if (market == null || market.tokens.isEmpty()) continue;
-                    MARKETS.put(market.id, market);
-                    Database.saveMarket(market);
-                    stored++;
-                }
-                if (response.size() < 100) break;
-            }
-            log("Market refresh complete: " + stored + " active markets indexed.");
-        } catch (Exception e) {
-            log("Market refresh failed: " + shortError(e));
-        }
-    }
+            JsonNode data = get(
+                    "https://gamma-api.polymarket.com/markets"
+                    + "?active=true&closed=false&limit=500");
 
-    private static Market parseMarket(JsonNode n) {
-        String id = text(n, "conditionId", text(n, "id", ""));
-        if (id.isBlank()) return null;
-        String question = text(n, "question", text(n, "title", "Untitled market"));
-        String slug = text(n, "slug", "");
-        String endDate = text(n, "endDate", "");
-        double volume = number(n, "volumeNum", number(n, "volume", 0));
-        List<String> outcomes = parseStringArray(n.get("outcomes"));
-        List<String> tokenIds = parseStringArray(n.get("clobTokenIds"));
-        List<Token> tokens = new ArrayList<>();
-        for (int i = 0; i < Math.min(outcomes.size(), tokenIds.size()); i++) {
-            tokens.add(new Token(outcomes.get(i), tokenIds.get(i)));
-        }
-        return new Market(id, question, slug, endDate, volume, tokens);
-    }
+            if (!data.isArray()) return;
 
-    private static List<String> parseStringArray(JsonNode node) {
-        if (node == null || node.isNull()) return List.of();
-        try {
-            JsonNode actual = node;
-            if (node.isTextual()) actual = JSON.readTree(node.asText());
-            if (!actual.isArray()) return List.of();
-            List<String> values = new ArrayList<>();
-            actual.forEach(v -> values.add(v.asText()));
-            return values;
-        } catch (Exception ignored) {
-            return List.of();
-        }
-    }
+            for (JsonNode n : data) {
+                String id = s(n, "conditionId", s(n, "id", ""));
+                String q = s(n, "question", "");
+                if (id.isBlank() || q.isBlank()) continue;
 
-    private static void pollBooks() {
-        List<Token> tokens = MARKETS.values().stream()
-                .flatMap(m -> m.tokens.stream())
-                .filter(t -> !t.id.isBlank())
-                .limit(500)
-                .toList();
-        if (tokens.isEmpty()) return;
-
-        // CLOB /books is the batch form; fall back to individual /book calls if needed.
-        try {
-            ArrayNode params = JSON.createArrayNode();
-            for (Token token : tokens) params.add(JSON.createObjectNode().put("token_id", token.id));
-            String body = JSON.writeValueAsString(JSON.createObjectNode().set("params", params));
-            HttpRequest request = HttpRequest.newBuilder(URI.create(CLOB + "/books"))
-                    .timeout(Duration.ofSeconds(25))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build();
-            HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() >= 200 && response.statusCode() < 300) {
-                JsonNode books = JSON.readTree(response.body());
-                if (books.isArray()) {
-                    for (JsonNode b : books) saveBook(b);
-                    return;
-                }
-            }
-        } catch (Exception e) {
-            log("Batch book request unavailable; using individual books: " + shortError(e));
-        }
-
-        List<CompletableFuture<Void>> futures = tokens.stream().limit(80)
-                .map(t -> CompletableFuture.runAsync(() -> {
-                    try { saveBook(getJson(CLOB + "/book?token_id=" + enc(t.id))); }
-                    catch (Exception ignored) {}
-                }, HTTP_POOL)).toList();
-        futures.forEach(f -> { try { f.get(30, TimeUnit.SECONDS); } catch (Exception ignored) {} });
-    }
-
-    private static void saveBook(JsonNode n) {
-        String token = text(n, "asset_id", text(n, "market", ""));
-        if (token.isBlank()) return;
-        double[] bid = bestLevel(n.get("bids"), true);
-        double[] ask = bestLevel(n.get("asks"), false);
-        Book book = new Book(token, bid[0], bid[1], ask[0], ask[1], System.currentTimeMillis());
-        BOOK_CACHE.put(token, book);
-        Database.saveBook(book);
-    }
-
-    private static double[] bestLevel(JsonNode levels, boolean highest) {
-        double bestPrice = 0;
-        double bestSize = 0;
-        if (levels == null || !levels.isArray()) return new double[]{0, 0};
-        for (JsonNode level : levels) {
-            double p = number(level, "price", 0);
-            double s = number(level, "size", 0);
-            if (p <= 0 || s <= 0) continue;
-            if (bestPrice == 0 || (highest ? p > bestPrice : p < bestPrice)) {
-                bestPrice = p;
-                bestSize = s;
-            }
-        }
-        return new double[]{bestPrice, bestSize};
-    }
-
-    private static void backfillHistory() {
-        long now = System.currentTimeMillis();
-        if (now - lastHistoryRefresh.get() < TimeUnit.MINUTES.toMillis(30)) return;
-        lastHistoryRefresh.set(now);
-        List<Token> tokens = MARKETS.values().stream()
-                .flatMap(m -> m.tokens.stream())
-                .filter(t -> !t.id.isBlank())
-                .limit(MAX_HISTORY_TOKENS_PER_CYCLE)
-                .toList();
-        if (tokens.isEmpty()) {
-            log("Historical backfill waiting for market metadata.");
-            return;
-        }
-        long end = Instant.now().getEpochSecond();
-        long start = Instant.now().minus(Duration.ofDays(HISTORY_DAYS)).getEpochSecond();
-        AtomicLong points = new AtomicLong();
-        List<CompletableFuture<Void>> futures = tokens.stream().map(token ->
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        String url = CLOB + "/prices-history?market=" + enc(token.id)
-                                + "&startTs=" + start + "&endTs=" + end + "&fidelity=5";
-                        JsonNode response = getJson(url);
-                        JsonNode history = response.path("history");
-                        if (history.isArray()) {
-                            for (JsonNode p : history) {
-                                long ts = p.path("t").asLong(0);
-                                double price = p.path("p").asDouble(-1);
-                                if (ts > 0 && price >= 0 && price <= 1) {
-                                    Database.savePrice(token.id, ts, price, "HISTORY");
-                                    points.incrementAndGet();
-                                }
-                            }
-                        }
-                    } catch (Exception e) {
-                        log("History fetch failed for token " + abbreviate(token.id) + ": " + shortError(e));
-                    }
-                }, HTTP_POOL)).toList();
-        futures.forEach(f -> { try { f.get(90, TimeUnit.SECONDS); } catch (Exception ignored) {} });
-        log("Historical backfill complete: " + points.get() + " price observations processed.");
-    }
-
-    // ---------------------------------------------------------------------
-    // Research strategies
-    // ---------------------------------------------------------------------
-
-    private static void runStrategyScans() {
-        if (MARKETS.isEmpty()) return;
-        runParityScan();
-        runNestedRelationshipScan();
-        runReversalScan();
-        runResolutionResearch();
-        runLeadLagResearch();
-    }
-
-    private static void runParityScan() {
-        for (Market m : MARKETS.values()) {
-            Token yes = findOutcome(m, "yes");
-            Token no = findOutcome(m, "no");
-            if (yes == null || no == null) continue;
-            Book y = BOOK_CACHE.get(yes.id), n = BOOK_CACHE.get(no.id);
-            if (y == null || n == null || y.ask <= 0 || n.ask <= 0) continue;
-            double cost = y.ask + n.ask;
-            double edge = 1.0 - cost;
-            if (edge > 0.005) {
-                double size = Math.min(y.askSize, n.askSize);
-                double maxShares = Math.max(0, size);
-                if (maxShares > 0) {
-                    recordSignal("YES/NO parity", m, edge,
-                            "Buy YES + NO theoretical settlement floor $1; asks=" +
-                                    fmt(y.ask) + "+" + fmt(n.ask) + "; matched shares available≈" +
-                                    fmt(maxShares) + ". Fees and simultaneous fills still need confirmation.",
-                            "OBSERVATION");
-                }
-            }
-        }
-    }
-
-    private static void runNestedRelationshipScan() {
-        List<Market> list = new ArrayList<>(MARKETS.values());
-        // Deliberately conservative: only flag candidate pairs for human review.
-        // Titles alone cannot prove logical implication or identical resolution rules.
-        for (int i = 0; i < list.size(); i++) {
-            Market a = list.get(i);
-            String keyA = topicKey(a.question);
-            if (keyA.isBlank()) continue;
-            for (int j = i + 1; j < Math.min(list.size(), i + 40); j++) {
-                Market b = list.get(j);
-                if (keyA.equals(topicKey(b.question)) && !a.id.equals(b.id)) {
-                    recordSignal("Nested-market relationships", a, 0,
-                            "Related-title candidate with market " + b.id +
-                                    ". No implication is assumed; inspect both resolution rules before any arbitrage claim.",
-                            "REVIEW");
-                }
-            }
-        }
-    }
-
-    private static void runReversalScan() {
-        for (Market m : MARKETS.values()) {
-            for (Token token : m.tokens) {
+                double price = 0;
                 try {
-                    PricePair pair = Database.priceAround(token.id,
-                            Instant.now().minus(Duration.ofMinutes(5)).getEpochSecond());
-                    if (pair == null || pair.oldPrice <= 0) continue;
-                    Book book = BOOK_CACHE.get(token.id);
-                    if (book == null) continue;
-                    double move = pair.latestPrice - pair.oldPrice;
-                    double threshold = 0.08; // initial 8 percentage-point shock
-                    if (Math.abs(move) >= threshold) {
-                        Token opposite = oppositeToken(m, token);
-                        Book oppositeBook = opposite == null ? null : BOOK_CACHE.get(opposite.id);
-                        String direction = move > 0 ? "YES/contract price rose; inspect contrarian NO" :
-                                "YES/contract price fell; inspect contrarian YES";
-                        double executableAsk = oppositeBook == null ? 0 : oppositeBook.ask;
-                        recordSignal("Short-term reversal", m, Math.abs(move),
-                                direction + "; five-minute move=" + fmt(move * 100) +
-                                        " percentage points; opposite best ask=" + fmt(executableAsk) +
-                                        ". No trade is simulated without adequate depth and fees.",
-                                "OBSERVATION");
+                    JsonNode prices = n.get("outcomePrices");
+                    if (prices != null) {
+                        if (prices.isTextual()) prices = J.readTree(prices.asText());
+                        if (prices.isArray() && prices.size() > 0)
+                            price = Double.parseDouble(prices.get(0).asText());
                     }
                 } catch (Exception ignored) {}
+
+                add(new Market("POLYMARKET", id, q,
+                        "https://polymarket.com/event/" + s(n, "slug", ""),
+                        s(n, "endDate", ""), price, "USD",
+                        "", "", 0, "", ""));
             }
-        }
+        } catch (Exception e) { log("Polymarket: " + e.getMessage()); }
     }
 
-    private static void runResolutionResearch() {
-        long now = System.currentTimeMillis();
-        for (Market m : MARKETS.values()) {
-            long end = parseDateMillis(m.endDate);
-            if (end <= 0) continue;
-            long hours = (end - now) / 3_600_000L;
-            if (hours >= 0 && hours <= 24) {
-                recordSignal("Resolution countdown", m, 0,
-                        "Market enters the <=24-hour resolution research bucket (" + hours +
-                                " hours by metadata). This is not confirmation of the outcome.",
-                        "RESEARCH");
-            }
-        }
-    }
-
-    private static void runLeadLagResearch() {
-        // Lightweight candidate generation: markets sharing distinctive title tokens.
-        // Actual lag regression is run by the optimizer once enough overlapping points exist.
-        List<Market> list = new ArrayList<>(MARKETS.values());
-        for (int i = 0; i < list.size(); i++) {
-            Market a = list.get(i);
-            String key = topicKey(a.question);
-            if (key.length() < 8) continue;
-            for (int j = i + 1; j < Math.min(list.size(), i + 25); j++) {
-                Market b = list.get(j);
-                if (key.equals(topicKey(b.question))) {
-                    recordSignal("Cross-market lead-lag", a, 0,
-                            "Related-market candidate: " + b.question +
-                                    ". Pair is queued conceptually; relationship and lag must be measured, not assumed.",
-                            "RESEARCH");
-                }
-            }
-        }
-    }
-
-    private static void optimize() {
-        // A small, transparent parameter sweep over the reversal threshold.
-        // Scores use chronological train/validation slices and price-only mark changes.
-        List<Double> thresholds = List.of(0.03, 0.05, 0.08, 0.10, 0.12, 0.15);
-        int tested = 0;
-        for (Market market : MARKETS.values().stream().limit(80).toList()) {
-            for (Token token : market.tokens) {
-                List<PricePoint> points = Database.recentPrices(token.id, 1200);
-                if (points.size() < 80) continue;
-                for (double threshold : thresholds) {
-                    Score score = evaluateReversal(points, threshold);
-                    Database.saveExperiment("Short-term reversal", token.id, threshold,
-                            score.train, score.validation, score.trades);
-                    tested++;
-                }
-            }
-        }
-        if (tested > 0) {
-            Database.saveDiscovery("Parameter sweep completed",
-                    "Evaluated " + tested + " reversal configurations using chronological training/validation splits. " +
-                    "These are price-series research scores, not executable P&L.",
-                    "PARAMETER_SEARCH");
-            log("Optimizer completed " + tested + " parameter evaluations.");
-        }
-    }
-
-    private static Score evaluateReversal(List<PricePoint> p, double threshold) {
-        int split = (int) (p.size() * 0.70);
-        double train = 0, validation = 0;
-        int trainN = 0, validationN = 0;
-        for (int i = 1; i < p.size() - 3; i++) {
-            double shock = p.get(i).price - p.get(i - 1).price;
-            if (Math.abs(shock) < threshold) continue;
-            double future = p.get(i + 3).price - p.get(i).price;
-            double strategyReturn = -Math.signum(shock) * future;
-            if (i < split) { train += strategyReturn; trainN++; }
-            else { validation += strategyReturn; validationN++; }
-        }
-        return new Score(trainN == 0 ? 0 : train / trainN,
-                validationN == 0 ? 0 : validation / validationN, trainN + validationN);
-    }
-
-    private static void recordSignal(String strategy, Market market, double magnitude,
-                                     String detail, String kind) {
-        // Deduplicate identical strategy/market observations for a short period.
-        Database.insertSignal(strategy, market.id, market.question, magnitude, detail, kind);
-    }
-
-    // ---------------------------------------------------------------------
-    // HTTP server and JSON API
-    // ---------------------------------------------------------------------
-
-    private static void startWebServer() throws IOException {
-        HttpServer server = HttpServer.create(new InetSocketAddress("0.0.0.0", PORT), 0);
-        server.setExecutor(Executors.newFixedThreadPool(8, namedFactory("web")));
-        server.createContext("/", Main::serveIndex);
-        server.createContext("/api/state", ex -> json(ex, Database.state()));
-        server.createContext("/api/strategies", ex -> json(ex, Database.strategyStats()));
-        server.createContext("/api/discoveries", ex -> json(ex, Database.discoveries()));
-        server.createContext("/api/signals", ex -> json(ex, Database.signals()));
-        server.createContext("/api/experiments", ex -> json(ex, Database.experiments()));
-        server.createContext("/api/logs", ex -> json(ex, Map.of("logs", List.copyOf(RECENT_LOGS))));
-        server.createContext("/health", ex -> json(ex, Map.of("status", systemStatus, "time", Instant.now().toString())));
-        server.start();
-    }
-
-    private static void serveIndex(HttpExchange ex) throws IOException {
-        if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
-            ex.sendResponseHeaders(405, -1); return;
-        }
-        String path = ex.getRequestURI().getPath();
-        if (!path.equals("/") && !path.equals("/index.html")) {
-            send(ex, 404, "Not found", "text/plain; charset=utf-8"); return;
-        }
-        Path file = Path.of("/app/index.html");
-        if (!Files.exists(file)) file = Path.of("index.html");
-        if (!Files.exists(file)) {
-            send(ex, 500, "index.html not found in container", "text/plain; charset=utf-8"); return;
-        }
-        send(ex, 200, Files.readString(file), "text/html; charset=utf-8");
-    }
-
-    private static void json(HttpExchange ex, Object data) throws IOException {
+    static void kalshi() {
         try {
-            byte[] bytes = JSON.writeValueAsBytes(data);
-            ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
-            ex.getResponseHeaders().set("Cache-Control", "no-store");
-            ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
-            ex.sendResponseHeaders(200, bytes.length);
-            ex.getResponseBody().write(bytes);
-        } finally { ex.close(); }
+            JsonNode data = get(
+                    "https://api.elections.kalshi.com/trade-api/v2/markets"
+                    + "?status=open&limit=200");
+
+            JsonNode markets = data.path("markets");
+            if (!markets.isArray()) return;
+
+            for (JsonNode n : markets) {
+                String id = s(n, "ticker", "");
+                String q = s(n, "title", "");
+                if (id.isBlank() || q.isBlank()) continue;
+
+                double price = number(n, "yes_ask_dollars",
+                        number(n, "last_price_dollars", 0));
+
+                if (price > 1) price /= 100.0;
+
+                add(new Market("KALSHI", id, q,
+                        "https://kalshi.com/markets/" + id,
+                        s(n, "close_time", ""), price, "USD",
+                        "", "", 0, "", ""));
+            }
+        } catch (Exception e) { log("Kalshi: " + e.getMessage()); }
     }
 
-    private static void send(HttpExchange ex, int code, String body, String type) throws IOException {
-        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-        ex.getResponseHeaders().set("Content-Type", type);
-        ex.sendResponseHeaders(code, bytes.length);
-        ex.getResponseBody().write(bytes);
-        ex.close();
+    static void manifold() {
+        try {
+            JsonNode data = get(
+                    "https://api.manifold.markets/v0/markets?limit=500");
+
+            if (!data.isArray()) return;
+
+            for (JsonNode n : data) {
+                String id = s(n, "id", "");
+                String q = s(n, "question", "");
+                if (id.isBlank() || q.isBlank()) continue;
+
+                double price = number(n, "probability", 0);
+
+                add(new Market("MANIFOLD", id, q,
+                        s(n, "url", ""),
+                        s(n, "closeTime", ""), price, "MANA",
+                        "", "", 0, "", ""));
+            }
+        } catch (Exception e) { log("Manifold: " + e.getMessage()); }
     }
 
-    // ---------------------------------------------------------------------
-    // Utilities / domain objects
-    // ---------------------------------------------------------------------
-
-    private static JsonNode getJson(String url) throws Exception {
-        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-                .timeout(Duration.ofSeconds(25))
-                .header("Accept", "application/json")
-                .header("User-Agent", "PolymarketResearchLab/1.0")
-                .GET().build();
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
-        if (response.statusCode() < 200 || response.statusCode() >= 300)
-            throw new IOException("HTTP " + response.statusCode() + " from " + url);
-        return JSON.readTree(response.body());
+    static void add(Market raw) {
+        Market m = normalize(raw);
+        MARKETS.put(m.venue + ":" + m.id, m);
     }
 
-    private static Token findOutcome(Market m, String name) {
-        return m.tokens.stream().filter(t -> t.outcome.equalsIgnoreCase(name)).findFirst().orElse(null);
-    }
+    // ============================================================
+    // CONTRACT NORMALIZATION
+    // ============================================================
 
-    private static Token oppositeToken(Market m, Token token) {
-        return m.tokens.stream().filter(t -> !t.id.equals(token.id)).findFirst().orElse(null);
-    }
+    static Market normalize(Market m) {
+        String q = m.question.toLowerCase(Locale.ROOT);
 
-    private static String topicKey(String title) {
-        String s = title.toLowerCase(Locale.ROOT)
-                .replaceAll("\\b(will|the|a|an|be|by|before|after|above|below|over|under|reach|hit|to|in|on|at|of|and|or)\\b", " ")
-                .replaceAll("[^a-z0-9 ]", " ")
+        String clean = q.replaceAll("[^a-z0-9 ]", " ")
                 .replaceAll("\\s+", " ").trim();
-        return s.length() > 90 ? s.substring(0, 90) : s;
-    }
 
-    private static long parseDateMillis(String value) {
-        if (value == null || value.isBlank()) return -1;
-        try { return OffsetDateTime.parse(value).toInstant().toEpochMilli(); }
-        catch (DateTimeParseException ignored) {
-            try { return Instant.parse(value).toEpochMilli(); }
-            catch (Exception e) { return -1; }
-        }
-    }
+        String entity = clean;
+        double threshold = 0;
+        String operator = "";
+        String predicate = "";
 
-    private static String text(JsonNode n, String key, String fallback) {
-        JsonNode v = n == null ? null : n.get(key);
-        return v == null || v.isNull() ? fallback : v.asText(fallback);
-    }
+        Pattern p = Pattern.compile(
+                "(above|over|exceed|greater than|below|under|less than|reach|hit|at least|at most)\\s*\\$?([0-9,]+(?:\\.[0-9]+)?)",
+                Pattern.CASE_INSENSITIVE);
 
-    private static double number(JsonNode n, String key, double fallback) {
-        JsonNode v = n == null ? null : n.get(key);
-        if (v == null || v.isNull()) return fallback;
-        try { return v.isNumber() ? v.asDouble() : Double.parseDouble(v.asText()); }
-        catch (Exception e) { return fallback; }
-    }
+        Matcher matcher = p.matcher(clean);
 
-    private static String enc(String s) {
-        return URLEncoder.encode(s, StandardCharsets.UTF_8);
-    }
+        if (matcher.find()) {
+            predicate = matcher.group(1);
+            try {
+                threshold = Double.parseDouble(
+                        matcher.group(2).replace(",", ""));
+            } catch (Exception ignored) {}
 
-    private static String fmt(double d) { return String.format(Locale.US, "%.4f", d); }
-    private static String abbreviate(String s) { return s.length() <= 12 ? s : s.substring(0, 8) + "…"; }
-    private static String shortError(Throwable e) {
-        String m = e.getMessage();
-        return e.getClass().getSimpleName() + (m == null ? "" : ": " + m.substring(0, Math.min(180, m.length())));
-    }
-    private static String env(String key, String fallback) {
-        String v = System.getenv(key);
-        return v == null || v.isBlank() ? fallback : v;
-    }
-    private static ThreadFactory namedFactory(String prefix) {
-        AtomicLong count = new AtomicLong();
-        return r -> {
-            Thread t = new Thread(r, prefix + "-" + count.incrementAndGet());
-            t.setDaemon(true);
-            return t;
-        };
-    }
-    private static void safeRun(String name, Runnable task) {
-        try { task.run(); }
-        catch (Throwable t) { log(name + " failed: " + shortError(t)); }
-    }
-    private static void log(String message) {
-        String line = Instant.now() + " " + message;
-        System.out.println(line);
-        RECENT_LOGS.addFirst(line);
-        while (RECENT_LOGS.size() > 150) RECENT_LOGS.removeLast();
-        try { Database.log(line); } catch (Exception ignored) {}
-    }
-    private static void shutdown() {
-        if (!STOPPING.compareAndSet(false, true)) return;
-        systemStatus = "STOPPING";
-        log("Shutdown requested; stopping scheduled work.");
-        SCHEDULER.shutdown();
-        HTTP_POOL.shutdown();
-        BACKTEST_POOL.shutdown();
-        try {
-            SCHEDULER.awaitTermination(5, TimeUnit.SECONDS);
-            HTTP_POOL.awaitTermination(5, TimeUnit.SECONDS);
-            BACKTEST_POOL.awaitTermination(5, TimeUnit.SECONDS);
-        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        systemStatus = "STOPPED";
-    }
+            operator = switch (predicate) {
+                case "above", "over", "exceed", "greater than", "reach", "hit" -> "GT";
+                case "below", "under", "less than" -> "LT";
+                case "at least" -> "GTE";
+                case "at most" -> "LTE";
+                default -> "";
+            };
 
-    private record Token(String outcome, String id) {}
-    private record Market(String id, String question, String slug, String endDate,
-                          double volume, List<Token> tokens) {}
-    private record Book(String token, double bid, double bidSize, double ask, double askSize, long ts) {}
-    private record PricePair(double oldPrice, double latestPrice) {}
-    private record PricePoint(long ts, double price) {}
-    private record Score(double train, double validation, int trades) {}
-
-    // ---------------------------------------------------------------------
-    // SQLite
-    // ---------------------------------------------------------------------
-
-    private static final class Database {
-        private static Connection open() throws SQLException {
-            Connection c = DriverManager.getConnection("jdbc:sqlite:" + DB_FILE);
-            try (Statement s = c.createStatement()) {
-                s.execute("PRAGMA journal_mode=WAL");
-                s.execute("PRAGMA busy_timeout=5000");
-                s.execute("PRAGMA foreign_keys=ON");
-            }
-            return c;
+            entity = clean.substring(0, matcher.start()).trim();
         }
 
-        static void init() throws SQLException {
-            try (Connection c = open(); Statement s = c.createStatement()) {
-                s.execute("""
-                    CREATE TABLE IF NOT EXISTS markets(
-                      id TEXT PRIMARY KEY, question TEXT, slug TEXT, end_date TEXT,
-                      volume REAL, token_json TEXT, updated_at INTEGER)
-                    """);
-                s.execute("""
-                    CREATE TABLE IF NOT EXISTS prices(
-                      token_id TEXT NOT NULL, ts INTEGER NOT NULL, price REAL NOT NULL,
-                      source TEXT NOT NULL, PRIMARY KEY(token_id,ts,source))
-                    """);
-                s.execute("CREATE INDEX IF NOT EXISTS idx_prices_token_ts ON prices(token_id,ts)");
-                s.execute("""
-                    CREATE TABLE IF NOT EXISTS books(
-                      token_id TEXT NOT NULL, ts INTEGER NOT NULL, bid REAL, bid_size REAL,
-                      ask REAL, ask_size REAL, PRIMARY KEY(token_id,ts))
-                    """);
-                s.execute("""
-                    CREATE TABLE IF NOT EXISTS signals(
-                      id INTEGER PRIMARY KEY AUTOINCREMENT, strategy TEXT, market_id TEXT,
-                      question TEXT, magnitude REAL, detail TEXT, kind TEXT, created_at INTEGER)
-                    """);
-                s.execute("CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at)");
-                s.execute("""
-                    CREATE TABLE IF NOT EXISTS experiments(
-                      id INTEGER PRIMARY KEY AUTOINCREMENT, strategy TEXT, token_id TEXT,
-                      parameter REAL, train_score REAL, validation_score REAL,
-                      trades INTEGER, created_at INTEGER)
-                    """);
-                s.execute("""
-                    CREATE TABLE IF NOT EXISTS discoveries(
-                      id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT,
-                      category TEXT, created_at INTEGER)
-                    """);
-                s.execute("""
-                    CREATE TABLE IF NOT EXISTS system_logs(
-                      id INTEGER PRIMARY KEY AUTOINCREMENT, line TEXT, created_at INTEGER)
-                    """);
+        entity = entity.replaceAll(
+                "\\b(will|the|a|an|be|by|before|after|in|on|at|of|and|or|to|this|next)\\b",
+                " ").replaceAll("\\s+", " ").trim();
+
+        String fingerprint = fingerprint(clean);
+
+        return new Market(m.venue, m.id, m.question, m.url,
+                m.end, m.price, m.currency, entity,
+                predicate, threshold, operator, fingerprint);
+    }
+
+    static String fingerprint(String text) {
+        Set<String> stop = Set.of(
+                "will", "the", "a", "an", "be", "by", "before",
+                "after", "in", "on", "at", "of", "and", "or",
+                "to", "is", "it", "this", "that", "what");
+
+        return Arrays.stream(text.toLowerCase().split("\\W+"))
+                .filter(x -> x.length() > 2 && !stop.contains(x))
+                .distinct().sorted()
+                .collect(java.util.stream.Collectors.joining(" "));
+    }
+
+    // ============================================================
+    // CANDIDATE GENERATION
+    // ============================================================
+
+    static List<Pair> generatePairs(List<Market> markets) {
+        Map<String, List<Market>> index = new HashMap<>();
+
+        for (Market m : markets) {
+            for (String token : m.fingerprint.split(" ")) {
+                if (token.length() < 3) continue;
+                index.computeIfAbsent(token, k -> new ArrayList<>()).add(m);
             }
         }
 
-        static void saveMarket(Market m) {
-            String tokenJson;
-            try { tokenJson = JSON.writeValueAsString(m.tokens); }
-            catch (Exception e) { tokenJson = "[]"; }
-            try (Connection c = open(); PreparedStatement p = c.prepareStatement("""
-                INSERT INTO markets(id,question,slug,end_date,volume,token_json,updated_at)
-                VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET question=excluded.question,slug=excluded.slug,
-                end_date=excluded.end_date,volume=excluded.volume,token_json=excluded.token_json,
-                updated_at=excluded.updated_at
-                """)) {
-                p.setString(1,m.id); p.setString(2,m.question); p.setString(3,m.slug);
-                p.setString(4,m.endDate); p.setDouble(5,m.volume); p.setString(6,tokenJson);
-                p.setLong(7,System.currentTimeMillis()); p.executeUpdate();
-            } catch (SQLException e) { log("DB saveMarket: " + shortError(e)); }
-        }
+        Set<String> seen = new HashSet<>();
+        List<Pair> results = new ArrayList<>();
 
-        static void savePrice(String token, long ts, double price, String source) {
-            try (Connection c = open(); PreparedStatement p = c.prepareStatement(
-                    "INSERT OR REPLACE INTO prices(token_id,ts,price,source) VALUES(?,?,?,?)")) {
-                p.setString(1,token); p.setLong(2,ts); p.setDouble(3,price); p.setString(4,source);
-                p.executeUpdate();
-            } catch (SQLException e) { log("DB savePrice: " + shortError(e)); }
-        }
+        for (List<Market> group : index.values()) {
+            if (group.size() > 80) continue;
 
-        static void saveBook(Book b) {
-            try (Connection c = open(); PreparedStatement p = c.prepareStatement(
-                    "INSERT OR REPLACE INTO books(token_id,ts,bid,bid_size,ask,ask_size) VALUES(?,?,?,?,?,?)")) {
-                p.setString(1,b.token); p.setLong(2,b.ts); p.setDouble(3,b.bid); p.setDouble(4,b.bidSize);
-                p.setDouble(5,b.ask); p.setDouble(6,b.askSize); p.executeUpdate();
-            } catch (SQLException e) { log("DB saveBook: " + shortError(e)); }
-        }
+            for (int i = 0; i < group.size(); i++) {
+                for (int j = i + 1; j < group.size(); j++) {
+                    Market a = group.get(i);
+                    Market b = group.get(j);
 
-        static PricePair priceAround(String token, long targetTs) {
-            try (Connection c = open(); PreparedStatement p = c.prepareStatement("""
-                SELECT
-                  (SELECT price FROM prices WHERE token_id=? AND ts<=? ORDER BY ts DESC LIMIT 1),
-                  (SELECT price FROM prices WHERE token_id=? ORDER BY ts DESC LIMIT 1)
-                """)) {
-                p.setString(1,token); p.setLong(2,targetTs); p.setString(3,token);
-                try (ResultSet r=p.executeQuery()) {
-                    if (r.next()) {
-                        double old=r.getDouble(1), latest=r.getDouble(2);
-                        if (!r.wasNull() && old > 0 && latest > 0) return new PricePair(old,latest);
-                    }
+                    if (a.venue.equals(b.venue) && a.id.equals(b.id)) continue;
+
+                    String key = a.venue.compareTo(b.venue) < 0
+                            ? a.venue + ":" + a.id + "|" + b.venue + ":" + b.id
+                            : b.venue + ":" + b.id + "|" + a.venue + ":" + a.id;
+
+                    if (!seen.add(key)) continue;
+
+                    Pair pair = classify(a, b);
+                    if (pair != null) results.add(pair);
                 }
-            } catch (SQLException e) { log("DB priceAround: " + shortError(e)); }
+            }
+        }
+
+        results.sort(Comparator.comparingDouble(
+                (Pair p) -> p.confidence + p.discrepancy).reversed());
+
+        return results;
+    }
+
+    // ============================================================
+    // RELATIONSHIP CLASSIFICATION
+    // ============================================================
+
+    static Pair classify(Market a, Market b) {
+        String relation;
+        String explanation;
+        double confidence = 0;
+
+        double similarity = similarity(a.fingerprint, b.fingerprint);
+
+        boolean sameEntity = !a.entity.isBlank()
+                && !b.entity.isBlank()
+                && similarity(a.entity, b.entity) >= 0.65;
+
+        boolean sameThreshold = sameEntity
+                && a.operator.equals(b.operator)
+                && a.threshold == b.threshold
+                && !a.operator.isBlank();
+
+        boolean nested = sameEntity
+                && !a.operator.isBlank()
+                && a.operator.equals(b.operator)
+                && a.threshold > 0 && b.threshold > 0
+                && a.threshold != b.threshold;
+
+        boolean complement = similarity >= 0.80
+                && ((a.question.toLowerCase().contains("not ")
+                && !b.question.toLowerCase().contains("not "))
+                || (b.question.toLowerCase().contains("not ")
+                && !a.question.toLowerCase().contains("not ")));
+
+        if (sameThreshold || similarity >= 0.94) {
+            relation = "EQUIVALENT";
+            confidence = Math.max(similarity, 0.95);
+            explanation = "Highly similar contract wording and/or matching normalized proposition. Verify resolution rules.";
+        } else if (nested) {
+            relation = "NESTED";
+            confidence = 0.90;
+            explanation = "Same underlying entity and direction, different thresholds. Potential logical implication.";
+        } else if (complement) {
+            relation = "COMPLEMENT";
+            confidence = similarity;
+            explanation = "Possible opposite propositions. Verify that both contracts describe exact complements.";
+        } else if (sameEntity && similarity >= 0.40) {
+            relation = "DEPENDENT";
+            confidence = similarity * 0.85;
+            explanation = "Shared underlying entity and overlapping contract vocabulary. Dependency is not proven.";
+        } else if (similarity >= 0.48) {
+            relation = "RELATED";
+            confidence = similarity;
+            explanation = "Lexical relationship candidate. Requires human review.";
+        } else {
             return null;
         }
 
-        static List<PricePoint> recentPrices(String token, int limit) {
-            List<PricePoint> out = new ArrayList<>();
-            try (Connection c=open(); PreparedStatement p=c.prepareStatement(
-                    "SELECT ts,price FROM prices WHERE token_id=? ORDER BY ts DESC LIMIT ?")) {
-                p.setString(1,token); p.setInt(2,limit);
-                try (ResultSet r=p.executeQuery()) {
-                    while(r.next()) out.add(new PricePoint(r.getLong(1),r.getDouble(2)));
-                }
-            } catch(SQLException e) { log("DB recentPrices: " + shortError(e)); }
-            Collections.reverse(out);
-            return out;
+        double discrepancy = 0;
+        if (a.price > 0 && b.price > 0) {
+            discrepancy = Math.abs(a.price - b.price);
         }
 
-        static void insertSignal(String strategy, String marketId, String question,
-                                 double magnitude, String detail, String kind) {
-            try (Connection c=open(); PreparedStatement p=c.prepareStatement("""
-                INSERT INTO signals(strategy,market_id,question,magnitude,detail,kind,created_at)
-                SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS(
-                  SELECT 1 FROM signals WHERE strategy=? AND market_id=? AND detail=? AND created_at>?)
+        return new Pair(a, b, relation, confidence,
+                discrepancy, explanation);
+    }
+
+    static double similarity(String a, String b) {
+        Set<String> x = new HashSet<>(Arrays.asList(a.split(" ")));
+        Set<String> y = new HashSet<>(Arrays.asList(b.split(" ")));
+
+        x.remove("");
+        y.remove("");
+
+        if (x.isEmpty() || y.isEmpty()) return 0;
+
+        Set<String> intersection = new HashSet<>(x);
+        intersection.retainAll(y);
+
+        Set<String> union = new HashSet<>(x);
+        union.addAll(y);
+
+        return (double) intersection.size() / union.size();
+    }
+
+    // ============================================================
+    // SQLITE: PERSISTENT DATA
+    // ============================================================
+
+    static Connection db() throws SQLException {
+        Connection c = DriverManager.getConnection("jdbc:sqlite:" + DB);
+        try (Statement s = c.createStatement()) {
+            s.execute("PRAGMA journal_mode=WAL");
+            s.execute("PRAGMA busy_timeout=10000");
+            s.execute("PRAGMA synchronous=NORMAL");
+        }
+        return c;
+    }
+
+    static void initDB() throws SQLException {
+        try (Connection c = db(); Statement s = c.createStatement()) {
+            s.execute("""
+                CREATE TABLE IF NOT EXISTS markets(
+                    venue TEXT, id TEXT, question TEXT, url TEXT,
+                    end_date TEXT, price REAL, fingerprint TEXT,
+                    updated INTEGER,
+                    PRIMARY KEY(venue,id))
+                """);
+
+            s.execute("""
+                CREATE TABLE IF NOT EXISTS pairs(
+                    pair_key TEXT PRIMARY KEY,
+                    venue_a TEXT, id_a TEXT, question_a TEXT, url_a TEXT,
+                    venue_b TEXT, id_b TEXT, question_b TEXT, url_b TEXT,
+                    relation TEXT, confidence REAL, discrepancy REAL,
+                    explanation TEXT, first_seen INTEGER, last_seen INTEGER,
+                    evaluations INTEGER DEFAULT 1)
+                """);
+
+            s.execute("""
+                CREATE TABLE IF NOT EXISTS evaluations(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pair_key TEXT, relation TEXT, confidence REAL,
+                    discrepancy REAL, created INTEGER)
+                """);
+
+            s.execute("""
+                CREATE TABLE IF NOT EXISTS events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message TEXT, created INTEGER)
+                """);
+
+            s.execute("CREATE INDEX IF NOT EXISTS idx_pairs_conf ON pairs(confidence)");
+            s.execute("CREATE INDEX IF NOT EXISTS idx_eval_pair ON evaluations(pair_key)");
+        }
+    }
+
+    static void saveMarket(Market m) {
+        try (Connection c = db(); PreparedStatement p = c.prepareStatement("""
+            INSERT INTO markets VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(venue,id) DO UPDATE SET
+            question=excluded.question,url=excluded.url,
+            end_date=excluded.end_date,price=excluded.price,
+            fingerprint=excluded.fingerprint,updated=excluded.updated
+            """)) {
+            p.setString(1, m.venue);
+            p.setString(2, m.id);
+            p.setString(3, m.question);
+            p.setString(4, m.url);
+            p.setString(5, m.end);
+            p.setDouble(6, m.price);
+            p.setString(7, m.fingerprint);
+            p.setLong(8, System.currentTimeMillis());
+            p.executeUpdate();
+        } catch (Exception e) { log("Market DB: " + e.getMessage()); }
+    }
+
+    static void savePair(Pair p) {
+        String key = pairKey(p.a, p.b);
+        long now = System.currentTimeMillis();
+
+        try (Connection c = db()) {
+            try (PreparedStatement q = c.prepareStatement("""
+                INSERT INTO pairs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                ON CONFLICT(pair_key) DO UPDATE SET
+                relation=excluded.relation,
+                confidence=excluded.confidence,
+                discrepancy=excluded.discrepancy,
+                explanation=excluded.explanation,
+                last_seen=excluded.last_seen,
+                evaluations=pairs.evaluations+1
                 """)) {
-                long now=System.currentTimeMillis();
-                p.setString(1,strategy); p.setString(2,marketId); p.setString(3,question);
-                p.setDouble(4,magnitude); p.setString(5,detail); p.setString(6,kind); p.setLong(7,now);
-                p.setString(8,strategy); p.setString(9,marketId); p.setString(10,detail);
-                p.setLong(11,now-TimeUnit.MINUTES.toMillis(30)); p.executeUpdate();
-            } catch(SQLException e) { log("DB insertSignal: " + shortError(e)); }
-        }
+                q.setString(1, key);
+                q.setString(2, p.a.venue);
+                q.setString(3, p.a.id);
+                q.setString(4, p.a.question);
+                q.setString(5, p.a.url);
+                q.setString(6, p.b.venue);
+                q.setString(7, p.b.id);
+                q.setString(8, p.b.question);
+                q.setString(9, p.b.url);
+                q.setString(10, p.relation);
+                q.setDouble(11, p.confidence);
+                q.setDouble(12, p.discrepancy);
+                q.setString(13, p.explanation);
+                q.setLong(14, now);
+                q.setLong(15, now);
+                q.executeUpdate();
+            }
 
-        static void saveExperiment(String strategy,String token,double parameter,double train,
-                                   double validation,int trades) {
-            try(Connection c=open();PreparedStatement p=c.prepareStatement("""
-                INSERT INTO experiments(strategy,token_id,parameter,train_score,validation_score,trades,created_at)
-                VALUES(?,?,?,?,?,?,?)
+            try (PreparedStatement q = c.prepareStatement("""
+                INSERT INTO evaluations(pair_key,relation,confidence,discrepancy,created)
+                VALUES(?,?,?,?,?)
                 """)) {
-                p.setString(1,strategy);p.setString(2,token);p.setDouble(3,parameter);
-                p.setDouble(4,train);p.setDouble(5,validation);p.setInt(6,trades);
-                p.setLong(7,System.currentTimeMillis());p.executeUpdate();
-            } catch(SQLException e) { log("DB saveExperiment: " + shortError(e)); }
-        }
+                q.setString(1, key);
+                q.setString(2, p.relation);
+                q.setDouble(3, p.confidence);
+                q.setDouble(4, p.discrepancy);
+                q.setLong(5, now);
+                q.executeUpdate();
+            }
+        } catch (Exception e) { log("Pair DB: " + e.getMessage()); }
+    }
 
-        static void saveDiscovery(String title,String body,String category) {
-            try(Connection c=open();PreparedStatement p=c.prepareStatement(
-                    "INSERT INTO discoveries(title,body,category,created_at) VALUES(?,?,?,?)")) {
-                p.setString(1,title);p.setString(2,body);p.setString(3,category);
-                p.setLong(4,System.currentTimeMillis());p.executeUpdate();
-            } catch(SQLException e) { log("DB discovery: " + shortError(e)); }
-        }
+    static String pairKey(Market a, Market b) {
+        String x = a.venue + ":" + a.id;
+        String y = b.venue + ":" + b.id;
+        return x.compareTo(y) < 0 ? x + "|" + y : y + "|" + x;
+    }
 
-        static void log(String line) {
-            try(Connection c=open();PreparedStatement p=c.prepareStatement(
-                    "INSERT INTO system_logs(line,created_at) VALUES(?,?)")) {
-                p.setString(1,line);p.setLong(2,System.currentTimeMillis());p.executeUpdate();
-            } catch(SQLException ignored) {}
-        }
+    // ============================================================
+    // WEB SERVER
+    // ============================================================
 
-        static Map<String,Object> state() {
-            Map<String,Object> m=new LinkedHashMap<>();
-            m.put("status",systemStatus);m.put("uptimeSeconds",(System.currentTimeMillis()-startedAt)/1000);
-            m.put("markets",MARKETS.size());m.put("cachedBooks",BOOK_CACHE.size());
-            m.put("database",DB_FILE.toString());m.put("historyDays",HISTORY_DAYS);
-            m.put("strategies",STRATEGY_NAMES.size());m.put("mode","PAPER / RESEARCH ONLY");
-            m.put("lastMarketRefresh",lastMarketRefresh.get());m.put("lastHistoryRefresh",lastHistoryRefresh.get());
-            m.put("signals",count("signals"));m.put("pricePoints",count("prices"));m.put("bookSnapshots",count("books"));
-            return m;
-        }
+    static void startWeb() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
+        server.setExecutor(POOL);
 
-        static long count(String table) {
-            if (!Set.of("signals","prices","books","markets","experiments","discoveries").contains(table)) return 0;
-            try(Connection c=open();Statement s=c.createStatement();ResultSet r=s.executeQuery("SELECT COUNT(*) FROM "+table)) {
-                return r.next()?r.getLong(1):0;
-            } catch(SQLException e) { return 0; }
-        }
+        server.createContext("/", ex -> {
+            send(ex, html(), "text/html");
+        });
 
-        static List<Map<String,Object>> strategyStats() {
-            List<Map<String,Object>> out=new ArrayList<>();
-            for(String name:STRATEGY_NAMES) {
-                Map<String,Object> row=new LinkedHashMap<>();row.put("name",name);
-                try(Connection c=open();PreparedStatement p=c.prepareStatement(
-                        "SELECT COUNT(*),MAX(created_at) FROM signals WHERE strategy=?")) {
-                    p.setString(1,name);try(ResultSet r=p.executeQuery()){
-                        if(r.next()){row.put("signals",r.getLong(1));row.put("lastSignal",r.getLong(2));}
-                    }
-                }catch(SQLException ignored){}
+        server.createContext("/api/state", ex -> {
+            Map<String,Object> m = new LinkedHashMap<>();
+            m.put("status", status);
+            m.put("uptimeSeconds", (System.currentTimeMillis() - started) / 1000);
+            m.put("markets", MARKETS.size());
+            m.put("pairs", count("pairs"));
+            m.put("evaluations", count("evaluations"));
+            m.put("lastScan", lastScan);
+            m.put("lastPair", lastPair);
+            m.put("evaluatedThisScan", evaluated);
+            m.put("database", DB);
+            sendJson(ex, m);
+        });
+
+        server.createContext("/api/pairs", ex -> {
+            sendJson(ex, rows("""
+                SELECT * FROM pairs
+                ORDER BY confidence DESC, discrepancy DESC
+                LIMIT 500
+                """));
+        });
+
+        server.createContext("/api/events", ex -> {
+            sendJson(ex, rows(
+                    "SELECT * FROM events ORDER BY id DESC LIMIT 50"));
+        });
+
+        server.createContext("/health", ex -> {
+            sendJson(ex, Map.of("status", status));
+        });
+
+        server.start();
+    }
+
+    static long count(String table) {
+        try (Connection c = db(); Statement s = c.createStatement();
+             ResultSet r = s.executeQuery("SELECT COUNT(*) FROM " + table)) {
+            return r.next() ? r.getLong(1) : 0;
+        } catch (Exception e) { return 0; }
+    }
+
+    static List<Map<String,Object>> rows(String sql) {
+        List<Map<String,Object>> out = new ArrayList<>();
+        try (Connection c = db(); Statement s = c.createStatement();
+             ResultSet r = s.executeQuery(sql)) {
+            ResultSetMetaData md = r.getMetaData();
+            while (r.next()) {
+                Map<String,Object> row = new LinkedHashMap<>();
+                for (int i = 1; i <= md.getColumnCount(); i++)
+                    row.put(md.getColumnLabel(i), r.getObject(i));
                 out.add(row);
             }
-            return out;
-        }
+        } catch (Exception e) { log("Query: " + e.getMessage()); }
+        return out;
+    }
 
-        static List<Map<String,Object>> discoveries() {
-            return queryRows("SELECT id,title,body,category,created_at FROM discoveries ORDER BY id DESC LIMIT 30");
+    static void sendJson(HttpExchange ex, Object o) throws java.io.IOException {
+        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        ex.getResponseHeaders().set("Cache-Control", "no-store");
+        byte[] b = J.writeValueAsBytes(o);
+        ex.getResponseHeaders().set("Content-Type", "application/json");
+        ex.sendResponseHeaders(200, b.length);
+        ex.getResponseBody().write(b);
+        ex.close();
+    }
+
+    static void send(HttpExchange ex, String body, String type)
+            throws java.io.IOException {
+        byte[] b = body.getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", type + "; charset=utf-8");
+        ex.sendResponseHeaders(200, b.length);
+        ex.getResponseBody().write(b);
+        ex.close();
+    }
+
+    // ============================================================
+    // DASHBOARD
+    // ============================================================
+
+    static String html() {
+        return """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Market Relationship Lab</title>
+        <style>
+        *{box-sizing:border-box}
+        body{background:#0b1020;color:#e5e7eb;font-family:Arial;margin:0;padding:25px}
+        h1{font-size:25px}
+        .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px}
+        .card{background:#151e32;border:1px solid #293650;border-radius:10px;padding:18px}
+        .number{font-size:28px;font-weight:bold;margin-top:9px}
+        .muted{color:#94a3b8;font-size:12px}
+        .green{color:#34d399}
+        .orange{color:#fbbf24}
+        .tablewrap{overflow-x:auto;margin-top:20px}
+        table{width:100%;border-collapse:collapse;min-width:1000px}
+        td,th{padding:12px;border-bottom:1px solid #293650;text-align:left;font-size:13px}
+        th{color:#94a3b8}
+        a{color:#60a5fa;text-decoration:none}
+        button{background:#2563eb;color:white;border:0;padding:10px 16px;border-radius:6px;cursor:pointer}
+        .bar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+        </style>
+        </head>
+        <body>
+        <div class="bar">
+        <div><h1>Market Relationship Lab</h1>
+        <div class="muted">Cross-platform prediction market research</div></div>
+        <button onclick="refresh()">Refresh</button>
+        </div>
+        <br>
+        <div class="grid">
+          <div class="card">SERVER STATUS<div class="number green" id="status">...</div></div>
+          <div class="card">MARKETS<div class="number" id="markets">0</div></div>
+          <div class="card">SAVED PAIRS<div class="number" id="pairs">0</div></div>
+          <div class="card">EVALUATIONS<div class="number" id="evaluations">0</div></div>
+          <div class="card">UPTIME<div class="number" id="uptime">0</div></div>
+          <div class="card">LAST SCAN<div class="number" id="lastscan">Never</div></div>
+        </div>
+        <br>
+        <div class="card">
+        <h3>Last evaluated pair</h3>
+        <div id="lastpair" class="muted">Waiting...</div>
+        <p class="muted" id="database"></p>
+        </div>
+        <div class="bar"><h2>Discovered relationships</h2>
+        <span class="muted">Sorted by confidence and discrepancy</span></div>
+        <div class="tablewrap">
+        <table>
+        <thead><tr>
+        <th>Relationship</th><th>Confidence</th><th>Difference</th>
+        <th>Market A</th><th>Market B</th><th>Explanation</th><th>Evaluations</th>
+        </tr></thead>
+        <tbody id="table"></tbody>
+        </table>
+        </div>
+        <script>
+        const fmt=x=>Number(x||0).toFixed(3);
+        async function refresh(){
+          try{
+            let s=await (await fetch('/api/state')).json();
+            for(let k of ['status','markets','pairs','evaluations'])
+              document.getElementById(k).textContent=s[k];
+            document.getElementById('uptime').textContent=
+              Math.floor(s.uptimeSeconds/3600)+'h '+Math.floor(s.uptimeSeconds%3600/60)+'m';
+            document.getElementById('lastscan').textContent=
+              s.lastScan?new Date(s.lastScan).toLocaleTimeString():'Never';
+            document.getElementById('lastpair').textContent=s.lastPair;
+            document.getElementById('database').textContent='Database: '+s.database;
+            let rows=await (await fetch('/api/pairs')).json();
+            document.getElementById('table').innerHTML=rows.map(p=>`
+              <tr>
+              <td><b>${p.relation}</b></td>
+              <td>${fmt(p.confidence)}</td>
+              <td>${fmt(p.discrepancy)}</td>
+              <td><a target="_blank" href="${p.url_a||'#'}">${p.venue_a}: ${p.question_a}</a></td>
+              <td><a target="_blank" href="${p.url_b||'#'}">${p.venue_b}: ${p.question_b}</a></td>
+              <td>${p.explanation}</td>
+              <td>${p.evaluations}</td>
+              </tr>`).join('');
+          }catch(e){console.log(e)}
         }
-        static List<Map<String,Object>> signals() {
-            return queryRows("SELECT id,strategy,question,magnitude,detail,kind,created_at FROM signals ORDER BY id DESC LIMIT 60");
-        }
-        static List<Map<String,Object>> experiments() {
-            return queryRows("SELECT id,strategy,parameter,train_score,validation_score,trades,created_at FROM experiments ORDER BY id DESC LIMIT 100");
-        }
-        static List<Map<String,Object>> queryRows(String sql) {
-            List<Map<String,Object>> out=new ArrayList<>();
-            try(Connection c=open();Statement s=c.createStatement();ResultSet r=s.executeQuery(sql)){
-                ResultSetMetaData md=r.getMetaData();
-                while(r.next()){
-                    Map<String,Object> row=new LinkedHashMap<>();
-                    for(int i=1;i<=md.getColumnCount();i++)row.put(md.getColumnLabel(i),r.getObject(i));
-                    out.add(row);
-                }
-            }catch(SQLException e){log("DB queryRows: "+shortError(e));}
-            return out;
-        }
+        refresh();setInterval(refresh,10000);
+        </script>
+        </body></html>
+        """;
+    }
+
+    // ============================================================
+    // UTILITIES
+    // ============================================================
+
+    static JsonNode get(String url) throws Exception {
+        HttpRequest r = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofSeconds(20))
+                .header("Accept", "application/json")
+                .header("User-Agent", "MarketRelationshipLab/1.0")
+                .GET().build();
+
+        HttpResponse<String> response = HTTP.send(
+                r, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200)
+            throw new RuntimeException("HTTP " + response.statusCode());
+
+        return J.readTree(response.body());
+    }
+
+    static String s(JsonNode n, String key, String fallback) {
+        JsonNode v = n.get(key);
+        return v == null || v.isNull() ? fallback : v.asText(fallback);
+    }
+
+    static double number(JsonNode n, String key, double fallback) {
+        try {
+            JsonNode v = n.get(key);
+            return v == null || v.isNull() ? fallback : v.asDouble(fallback);
+        } catch (Exception e) { return fallback; }
+    }
+
+    static void log(String message) {
+        String line = Instant.now() + " " + message;
+        System.out.println(line);
+
+        try (Connection c = db(); PreparedStatement p =
+                c.prepareStatement("INSERT INTO events(message,created) VALUES(?,?)")) {
+            p.setString(1, message);
+            p.setLong(2, System.currentTimeMillis());
+            p.executeUpdate();
+        } catch (Exception ignored) {}
     }
 }
