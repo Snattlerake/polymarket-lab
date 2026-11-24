@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Polymarket Research Lab</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2b;--panel2:#172238;--line:#26344d;--text:#edf2fa;--muted:#9aabc4;--green:#4ade80;--blue:#60a5fa;--amber:#fbbf24;--red:#fb7185}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(1000px 500px at 80% -10%,#1b3152 0,transparent 65%),var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+header{padding:22px 28px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;background:#0b1020dd;position:sticky;top:0;z-index:2;backdrop-filter:blur(12px)}
+.brand{display:flex;align-items:center;gap:12px}.logo{width:38px;height:38px;border-radius:12px;background:linear-gradient(135deg,#2563eb,#22c55e);display:grid;place-items:center;font-weight:900;font-size:18px}
+h1{font-size:18px;margin:0;letter-spacing:.02em}.sub{color:var(--muted);font-size:12px}.status{display:flex;align-items:center;gap:8px;color:var(--green);font-weight:700;font-size:12px}.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green)}
+main{max-width:1450px;margin:auto;padding:24px;display:grid;gap:18px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:linear-gradient(180deg,#151f32,#111a2b);border:1px solid var(--line);border-radius:16px;padding:17px;min-width:0;box-shadow:0 10px 30px #0002}.metric-label{color:var(--muted);font-size:12px}.metric{font-size:27px;font-weight:750;letter-spacing:-.04em;margin-top:5px}.metric-note{font-size:11px;color:var(--muted);margin-top:2px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:13px}.section-head h2{font-size:15px;margin:0}.pill{font-size:10px;padding:4px 8px;border:1px solid var(--line);border-radius:99px;color:var(--muted);white-space:nowrap}.two{display:grid;grid-template-columns:1.1fr .9fr;gap:18px}.strategy{display:grid;grid-template-columns:minmax(150px,1fr) 90px 80px;gap:10px;align-items:center;padding:12px 0;border-top:1px solid #26344d99}.strategy:first-of-type{border-top:0}.strategy-name{font-weight:650}.strategy small{display:block;color:var(--muted);font-size:11px}.count{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}.bar{height:5px;background:#26344d;border-radius:10px;overflow:hidden;margin-top:7px}.bar span{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#4ade80);border-radius:10px}
+.item{padding:12px 0;border-top:1px solid #26344d99}.item:first-of-type{border-top:0}.item-title{font-weight:650}.item-body{color:var(--muted);font-size:12px;margin-top:4px}.meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:7px}.tag{font-size:10px;color:#bfdbfe;background:#1e3a5f;padding:3px 7px;border-radius:6px}.tag.warn{color:#fde68a;background:#493715}.tag.good{color:#bbf7d0;background:#123b2a}
+table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;color:var(--muted);font-weight:550;padding:9px 7px;border-bottom:1px solid var(--line)}td{padding:10px 7px;border-bottom:1px solid #26344d88;vertical-align:top}td:first-child{max-width:280px}.mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,monospace}.muted{color:var(--muted)}.positive{color:var(--green)}.negative{color:var(--red)}.empty{color:var(--muted);padding:22px 0;text-align:center}.footer{color:var(--muted);font-size:11px;text-align:center;padding:10px}.actions{display:flex;gap:8px;align-items:center}button{background:#1d3558;color:#dbeafe;border:1px solid #35537d;padding:7px 10px;border-radius:8px;cursor:pointer}button:hover{background:#25466f}
+@media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}.two{grid-template-columns:1fr}}@media(max-width:560px){main{padding:14px}.grid{grid-template-columns:repeat(2,1fr)}header{padding:16px}.metric{font-size:22px}.strategy{grid-template-columns:1fr 65px}.strategy .bar{grid-column:1/-1}.count:last-child{display:none}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><div class="logo">P</div><div><h1>POLYMARKET RESEARCH LAB</h1><div class="sub">Autonomous quantitative research · paper-only</div></div></div>
+  <div class="actions"><div class="status"><span class="dot"></span><span id="status">CONNECTING</span></div><button onclick="refresh()">Refresh</button></div>
+</header>
+<main>
+  <section class="grid">
+    <div class="card"><div class="metric-label">Markets indexed</div><div class="metric" id="markets">—</div><div class="metric-note">Active Gamma markets</div></div>
+    <div class="card"><div class="metric-label">Price observations</div><div class="metric" id="prices">—</div><div class="metric-note">Historical + collected data</div></div>
+    <div class="card"><div class="metric-label">Order-book snapshots</div><div class="metric" id="books">—</div><div class="metric-note">Current-state snapshots over time</div></div>
+    <div class="card"><div class="metric-label">Research signals</div><div class="metric" id="signals">—</div><div class="metric-note">Observations, not executed trades</div></div>
+  </section>
+  <section class="card">
+    <div class="section-head"><h2>Research engine</h2><span class="pill" id="mode">PAPER / RESEARCH ONLY</span></div>
+    <div class="grid" style="grid-template-columns:repeat(3,1fr)">
+      <div><div class="metric-label">System uptime</div><div class="metric" style="font-size:19px" id="uptime">—</div></div>
+      <div><div class="metric-label">Cached live books</div><div class="metric" style="font-size:19px" id="cached">—</div></div>
+      <div><div class="metric-label">Configured strategy families</div><div class="metric" style="font-size:19px" id="strategyCount">5</div></div>
+    </div>
+  </section>
+  <section class="two">
+    <div class="card">
+      <div class="section-head"><h2>Strategy activity</h2><span class="pill">Signal counts</span></div>
+      <div id="strategies"><div class="empty">Waiting for strategy data…</div></div>
+    </div>
+    <div class="card">
+      <div class="section-head"><h2>What the system is learning</h2><span class="pill">Research notebook</span></div>
+      <div id="discoveries"><div class="empty">No discoveries yet. The optimizer runs after data arrives.</div></div>
+    </div>
+  </section>
+  <section class="card">
+    <div class="section-head"><h2>Recent observations</h2><span class="pill">Latest 60</span></div>
+    <div style="overflow:auto"><table><thead><tr><th>Strategy</th><th>Market</th><th>Magnitude</th><th>Type</th><th>Observation</th><th>Time</th></tr></thead><tbody id="signalsTable"><tr><td colspan="6" class="empty">No observations yet.</td></tr></tbody></table></div>
+  </section>
+  <section class="card">
+    <div class="section-head"><h2>Parameter experiments</h2><span class="pill">Chronological train / validation</span></div>
+    <div style="overflow:auto"><table><thead><tr><th>Strategy</th><th>Threshold</th><th>Training score</th><th>Validation score</th><th>Samples</th><th>Time</th></tr></thead><tbody id="experiments"><tr><td colspan="6" class="empty">No optimizer runs yet.</td></tr></tbody></table></div>
+  </section>
+  <section class="card">
+    <div class="section-head"><h2>System notes</h2><span class="pill">Read before interpreting results</span></div>
+    <div class="item"><div class="item-title">Historical candles are not historical order books</div><div class="item-body">A price-history observation cannot prove that a simulated order could have filled at that price. Current order-book snapshots are collected prospectively and build a more useful execution dataset over time.</div></div>
+    <div class="item"><div class="item-title">Signals are not profits</div><div class="item-body">This initial version records research observations and parameter scores. It does not claim realized P&amp;L, does not place orders, and does not establish that any strategy is profitable.</div></div>
+    <div class="item"><div class="item-title">Related titles are not proven arbitrage</div><div class="item-body">Nested-market candidates require manual verification of exact resolution rules and logical implication before they can be treated as guaranteed-payoff relationships.</div></div>
+  </section>
+  <div class="footer">Polymarket Research Lab · Data from public Polymarket endpoints · Paper/research mode only · Auto-refresh every 10 seconds</div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => Number(n||0).toLocaleString();
+const date = t => t ? new Date(Number(t)).toLocaleString() : "—";
+const safe = s => String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(path){const r=await fetch(path,{cache:"no-store"});if(!r.ok)throw new Error(r.status);return r.json()}
+async function refresh(){
+ try{
+  const [s,st,d,sg,ex]=await Promise.all([api("/api/state"),api("/api/strategies"),api("/api/discoveries"),api("/api/signals"),api("/api/experiments")]);
+  $("status").textContent=s.status||"UNKNOWN";$("markets").textContent=fmt(s.markets);$("prices").textContent=fmt(s.pricePoints);
+  $("books").textContent=fmt(s.bookSnapshots);$("signals").textContent=fmt(s.signals);$("cached").textContent=fmt(s.cachedBooks);
+  $("uptime").textContent=duration(s.uptimeSeconds);$("mode").textContent=s.mode||"RESEARCH";
+  $("strategyCount").textContent=fmt(s.strategies);
+  $("strategies").innerHTML=(st||[]).map(x=>`<div class="strategy"><div><div class="strategy-name">${safe(x.name)}</div><div class="bar"><span style="width:${Math.min(100,Number(x.signals||0))}%"></span></div></div><div class="count">${fmt(x.signals)} signals</div><div class="count">${x.lastSignal?date(x.lastSignal):"—"}</div></div>`).join("")||'<div class="empty">Waiting for strategy data…</div>';
+  $("discoveries").innerHTML=(d||[]).map(x=>`<div class="item"><div class="item-title">${safe(x.title)}</div><div class="item-body">${safe(x.body)}</div><div class="meta"><span class="tag">${safe(x.category)}</span><span class="muted">${date(x.created_at)}</span></div></div>`).join("")||'<div class="empty">No discoveries yet.</div>';
+  $("signalsTable").innerHTML=(sg||[]).map(x=>`<tr><td>${safe(x.strategy)}</td><td>${safe(x.question)}</td><td class="mono">${Number(x.magnitude||0).toFixed(4)}</td><td><span class="tag ${x.kind==="OBSERVATION"?"good":"warn"}">${safe(x.kind)}</span></td><td>${safe(x.detail)}</td><td class="muted">${date(x.created_at)}</td></tr>`).join("")||'<tr><td colspan="6" class="empty">No observations yet.</td></tr>';
+  $("experiments").innerHTML=(ex||[]).map(x=>`<tr><td>${safe(x.strategy)}</td><td class="mono">${Number(x.parameter).toFixed(3)}</td><td class="mono">${Number(x.train_score).toFixed(5)}</td><td class="mono">${Number(x.validation_score).toFixed(5)}</td><td>${fmt(x.trades)}</td><td class="muted">${date(x.created_at)}</td></tr>`).join("")||'<tr><td colspan="6" class="empty">No optimizer runs yet.</td></tr>';
+ }catch(e){$("status").textContent="API DISCONNECTED"}
+}
+function duration(s){s=Number(s||0);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?`${d}d ${h}h`:`${h}h ${m}m`}
+refresh();setInterval(refresh,10000);
+</script>
+</body>
+</html>
