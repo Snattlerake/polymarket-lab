@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Polymarket Research Lab</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0b1020;
+  --panel: #141c30;
+  --panel2: #1b2740;
+  --text: #e8edf8;
+  --muted: #91a0ba;
+  --line: #293650;
+  --green: #37d69a;
+  --red: #ff6b78;
+  --blue: #79aaff;
+  --yellow: #f5c96a;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, sans-serif;
+}
+header {
+  padding: 22px 28px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+h1 { margin: 0; font-size: 21px; }
+.sub { color: var(--muted); margin-top: 4px; }
+main { padding: 24px 28px; max-width: 1600px; margin: auto; }
+.controls { display: flex; gap: 9px; flex-wrap: wrap; }
+button {
+  border: 1px solid var(--line);
+  color: var(--text);
+  background: var(--panel2);
+  border-radius: 8px;
+  padding: 9px 14px;
+  cursor: pointer;
+  font-weight: 650;
+}
+button:hover { filter: brightness(1.2); }
+button.start { background: #13563f; border-color: #227c5c; }
+button.stop { background: #632b39; border-color: #914354; }
+button.scan { background: #203d70; border-color: #355b9b; }
+.status {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 11px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  color: var(--muted);
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+.dot.on { background: var(--green); }
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 12px;
+  margin: 20px 0;
+}
+.card, .panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.card { padding: 16px; }
+.card .number { font-size: 26px; font-weight: 750; }
+.card .label { color: var(--muted); }
+.panel { margin-top: 18px; overflow: hidden; }
+.panel-head {
+  padding: 15px 17px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.panel-head h2 { margin: 0; font-size: 15px; }
+.panel-body { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; min-width: 720px; }
+th, td {
+  text-align: left;
+  padding: 10px 13px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+th {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+td { max-width: 420px; overflow-wrap: anywhere; }
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.muted { color: var(--muted); }
+.pill {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 99px;
+  background: var(--panel2);
+  color: var(--yellow);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.pill.good { color: var(--green); }
+.pill.bad { color: var(--red); }
+.event { padding: 9px 14px; border-bottom: 1px solid var(--line); }
+.event small { color: var(--muted); margin-right: 9px; }
+.event.ERROR { color: var(--red); }
+.footer { color: var(--muted); padding: 18px 0; }
+@media(max-width:650px) {
+  header, main { padding-left: 14px; padding-right: 14px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Polymarket Research Lab</h1>
+    <div class="sub">Cross-market data collection · Relationship classification disabled</div>
+  </div>
+  <div class="controls">
+    <span class="status"><span id="dot" class="dot"></span><span id="scanStatus">Loading…</span></span>
+    <button class="start" onclick="control('start')">Start scanning</button>
+    <button class="stop" onclick="control('stop')">Stop scanning</button>
+    <button class="scan" onclick="control('scan')">Scan now</button>
+  </div>
+</header>
+
+<main>
+  <section class="cards">
+    <div class="card"><div class="number" id="marketCount">—</div><div class="label">Stored markets</div></div>
+    <div class="card"><div class="number" id="pairCount">—</div><div class="label">Candidate pairs</div></div>
+    <div class="card"><div class="number" id="relationshipCount">—</div><div class="label">Classified relationships</div></div>
+    <div class="card"><div class="number" id="scanCount">—</div><div class="label">Scan runs</div></div>
+    <div class="card"><div class="number" id="eventCount">—</div><div class="label">Events</div></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Candidate market pairs</h2><span class="muted">Latest 1,000 · Not classified</span></div>
+    <div class="panel-body">
+      <table>
+        <thead><tr><th>Market A</th><th>Venue</th><th>Price</th><th>Market B</th><th>Venue</th><th>Price</th><th>Status</th></tr></thead>
+        <tbody id="pairs"><tr><td colspan="7">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Markets</h2><span class="muted">Latest 1,000</span></div>
+    <div class="panel-body">
+      <table>
+        <thead><tr><th>Market</th><th>Venue</th><th>Price</th><th>Currency</th><th>End date</th><th>Last seen</th></tr></thead>
+        <tbody id="markets"><tr><td colspan="6">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Relationship records</h2><span class="muted">Manually or programmatically classified</span></div>
+    <div class="panel-body">
+      <table>
+        <thead><tr><th>Market A</th><th>Market B</th><th>Type</th><th>Dependent</th><th>Prerequisite</th><th>Confidence</th><th>Explanation</th></tr></thead>
+        <tbody id="relationships"><tr><td colspan="7">No relationship records yet.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Scan history</h2></div>
+    <div class="panel-body">
+      <table>
+        <thead><tr><th>Started</th><th>Finished</th><th>Polymarket</th><th>Kalshi</th><th>Total</th><th>Status</th><th>Error</th></tr></thead>
+        <tbody id="scans"><tr><td colspan="7">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Activity log</h2></div>
+    <div id="events"><div class="event">Loading…</div></div>
+  </section>
+
+  <div class="footer" id="updated">Waiting for first refresh…</div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+  }[c]));
+}
+function price(value, currency) {
+  if (value === null || value === undefined || value === "") return "—";
+  return `${Number(value).toFixed(4)} ${esc(currency || "")}`;
+}
+function link(url, label) {
+  return url
+    ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`
+    : esc(label);
+}
+async function api(path) {
+  const response = await fetch(path, {cache:"no-store"});
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+async function control(action) {
+  try {
+    await fetch("/api/control", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({action})
+    }).then(async r => {
+      if (!r.ok) throw new Error(await r.text());
+    });
+    await refresh();
+  } catch (e) {
+    alert("Control request failed: " + e.message);
+  }
+}
+async function refresh() {
+  try {
+    const [state, markets, pairs, relationships, events, scans] =
+      await Promise.all([
+        api("/api/state"), api("/api/markets"), api("/api/pairs"),
+        api("/api/relationships"), api("/api/events"), api("/api/scans")
+      ]);
+
+    $("dot").className = "dot" + (state.enabled ? " on" : "");
+    $("scanStatus").textContent = state.running
+      ? "Scan running"
+      : state.enabled ? "Scanning enabled" : "Scanning stopped";
+
+    $("marketCount").textContent = state.stats.markets;
+    $("pairCount").textContent = state.stats.pairs;
+    $("relationshipCount").textContent = state.stats.relationships;
+    $("scanCount").textContent = state.stats.scans;
+    $("eventCount").textContent = state.stats.events;
+
+    $("markets").innerHTML = markets.map(m => `
+      <tr>
+        <td>${link(m.url, m.question)}</td>
+        <td>${esc(m.venue)}</td>
+        <td>${price(m.price,m.currency)}</td>
+        <td>${esc(m.currency)}</td>
+        <td>${esc(m.end_date || "—")}</td>
+        <td>${esc(m.last_seen)}</td>
+      </tr>`).join("") || `<tr><td colspan="6">No markets stored yet.</td></tr>`;
+
+    $("pairs").innerHTML = pairs.map(p => `
+      <tr>
+        <td>${link(p.url_a,p.question_a)}</td>
+        <td>${esc(p.venue_a)}</td>
+        <td>${price(p.price_a,p.currency_a)}</td>
+        <td>${link(p.url_b,p.question_b)}</td>
+        <td>${esc(p.venue_b)}</td>
+        <td>${price(p.price_b,p.currency_b)}</td>
+        <td><span class="pill">${esc(p.status)}</span></td>
+      </tr>`).join("") || `<tr><td colspan="7">No candidate pairs yet.</td></tr>`;
+
+    $("relationships").innerHTML = relationships.map(r => `
+      <tr>
+        <td>${esc(r.market_a)}</td>
+        <td>${esc(r.market_b)}</td>
+        <td><span class="pill good">${esc(r.relationship_type)}</span></td>
+        <td>${esc(r.dependent_market || "—")}</td>
+        <td>${esc(r.prerequisite_market || "—")}</td>
+        <td>${r.confidence == null ? "—" : esc(r.confidence)}</td>
+        <td>${esc(r.explanation || "")}</td>
+      </tr>`).join("") || `<tr><td colspan="7">No relationships classified yet.</td></tr>`;
+
+    $("scans").innerHTML = scans.map(s => `
+      <tr>
+        <td>${esc(s.started_at)}</td>
+        <td>${esc(s.finished_at || "—")}</td>
+        <td>${esc(s.polymarket_count)}</td>
+        <td>${esc(s.kalshi_count)}</td>
+        <td>${esc(s.total_count)}</td>
+        <td>${esc(s.status)}</td>
+        <td>${esc(s.error || "")}</td>
+      </tr>`).join("") || `<tr><td colspan="7">No scans yet.</td></tr>`;
+
+    $("events").innerHTML = events.map(e => `
+      <div class="event ${esc(e.level)}">
+        <small>${esc(e.created_at)} · ${esc(e.level)}</small>
+        ${esc(e.message)}
+      </div>`).join("") || `<div class="event">No events yet.</div>`;
+
+    $("updated").textContent = "Last updated: " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("updated").textContent = "Refresh error: " + e.message;
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
